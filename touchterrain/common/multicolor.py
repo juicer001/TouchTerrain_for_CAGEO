@@ -8,12 +8,17 @@ terrain, so the parts touch but never overlap.
 
 Pipeline:
     elevation GeoTIFF (projected, meters)
-      -> resample to the feature grid (feature_res_mm on the print)
+      -> resample to the terrain grid (feature_res_mm on the print)
       -> load features (OpenStreetMap via Overpass, or a local GeoJSON file)
-      -> widen thin features to their minimum printed width
-      -> rasterize one mask per layer, settle overlaps by priority
-      -> build one watertight mesh per layer on a shared height field
+      -> smooth outlines in print mm: roads and rivers as bands along their
+         true centerlines (at least the minimum printed width), areas with
+         their real outlines; overlaps settled by priority
+      -> solids with manifold3d: terrain minus the exact pocket under each
+         outline; each layer = its outline x a slab that follows the terrain
       -> write one binary STL per layer (+ summary json)
+
+Edges follow the real map outlines, not the terrain grid, so diagonal roads
+and curved shorelines are smooth rather than stair-stepped.
 
 Part of TouchTerrain_for_MPH (a fork of TouchTerrain), GPL v3.
 """
@@ -27,7 +32,13 @@ import urllib.parse
 import urllib.request
 
 import numpy as np
-from osgeo import gdal, ogr, osr
+from osgeo import gdal, ogr, osr  # first: loads the conda C++ runtime the others share
+import manifold3d
+import shapely
+import shapely.affinity
+import shapely.geometry
+import shapely.ops
+import shapely.wkb
 
 gdal.UseExceptions()
 ogr.UseExceptions()
@@ -47,10 +58,13 @@ DEFAULTS = {
     "road_classes": ["motorway", "trunk", "primary", "secondary", "tertiary"],
     "town_landuse": ["residential", "commercial", "retail", "industrial"],
     "inlay_depth_mm": 0.6,                     # how deep each layer sits into the terrain
-    "road_height_mm": 0.4,                     # roads stand this far above the terrain
+    "road_height_mm": 0.0,                     # road surface relative to terrain (0 = flush)
+    "bridge_height_mm": 0.4,                   # roads stand this far up where they cross water
+    "bridge_extend_mm": 0.5,                   # raised part reaches this far onto each bank
     "water_height_mm": 0.0,                    # water surface relative to terrain (negative = recessed)
     "town_height_mm": 0.0,                     # town surface relative to terrain
-    "feature_res_mm": 0.25,                    # grid size on the print when features are on
+    "feature_res_mm": 0.25,                    # terrain grid size on the print
+    "outline_tolerance_mm": 0.02,              # outlines simplified to within this (keeps files small)
     "feature_priority": ["roads", "water", "towns"],  # first wins where layers overlap
     "toolheads": {"terrain": 1, "roads": 2, "water": 3, "towns": 4},
     "nozzle_mm": 0.4,                          # only used for warnings
@@ -81,21 +95,19 @@ def settings_with_defaults(job):
 def check_settings(s, basethick, log=print):
     """Apply the sanity rules; return list of warnings (also logged)."""
     warns = []
-    mins = []
     if "roads" in s["layers"]:
-        mins.append(s["road_min_width_mm"])
+        mins = [s["road_min_width_mm"]]
+    else:
+        mins = []
     if "water" in s["layers"]:
         mins.append(s["water_min_width_mm"])
-    if mins:
-        cap = min(mins) / 3.0
-        if s["feature_res_mm"] > cap:
-            warns.append(f"feature_res_mm {s['feature_res_mm']} is coarser than a third of the "
-                         f"smallest minimum width; using {cap:.3f}")
-            s["feature_res_mm"] = cap
-        for m in mins:
-            if m < 2 * s["nozzle_mm"]:
-                warns.append(f"minimum width {m} mm is under twice the {s['nozzle_mm']} mm nozzle; "
-                             f"it may not print as a solid line")
+    for m in mins:
+        if m < 2 * s["nozzle_mm"]:
+            warns.append(f"minimum width {m} mm is under twice the {s['nozzle_mm']} mm nozzle; "
+                         f"it may not print as a solid line")
+    for k in ("road_height_mm", "bridge_height_mm", "water_height_mm", "town_height_mm"):
+        if s[k] <= -s["inlay_depth_mm"]:
+            raise ValueError(f"{k} {s[k]} must be above -inlay_depth_mm ({-s['inlay_depth_mm']})")
     if basethick <= s["inlay_depth_mm"] + 0.2:
         warns.append(f"basethick {basethick} mm is too thin for a {s['inlay_depth_mm']} mm inlay; "
                      f"use at least {s['inlay_depth_mm'] + 0.6:.1f} mm")
@@ -270,7 +282,7 @@ def load_features_file(path, s):
 
 
 # --------------------------------------------------------------------------
-# raster helpers
+# elevation grid
 # --------------------------------------------------------------------------
 
 def read_dem(path):
@@ -308,102 +320,139 @@ def dem_bbox_wgs84(ds):
     return (min(ys), min(xs), max(ys), max(xs))
 
 
-def features_to_masks(feats, ds, s, m_per_mm, log=print):
-    """Widen features to their minimum printed width and rasterize one
-    boolean mask per layer on the dataset's grid.
-
-    Rasterizing keeps a cell only when its centre is inside a shape, which
-    can shave up to one cell off a narrow strip (more on diagonals). Widened
-    features therefore get half a cell diagonal of extra margin on each side:
-    any point within the minimum half-width then lies in a cell whose centre
-    is inside the shape, so the printed width never falls under the minimum
-    (on average it comes out about one cell wider)."""
-    margin = 0.5 * math.sqrt(2) * abs(ds.GetGeoTransform()[1])
-    proj = osr.SpatialReference(wkt=ds.GetProjection())
-    proj.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
-    tr = osr.CoordinateTransformation(_wgs84(), proj)
-    min_w = {"roads": s["road_min_width_mm"] * m_per_mm,
-             "water": s["water_min_width_mm"] * m_per_mm}
-    stats = {l: {"features": 0, "widened": 0} for l in s["layers"]}
-    shapes = {l: [] for l in s["layers"]}
-    for f in feats:
-        g = f["geom"].Clone()
-        g.Transform(tr)
-        layer = f["layer"]
-        stats[layer]["features"] += 1
-        if f["kind"] == "line":
-            true_w = f["width_m"] or 0
-            mw = min_w.get(layer, 0)
-            if mw > true_w:
-                stats[layer]["widened"] += 1
-                g = g.Buffer(mw / 2.0 + margin, 4)
-            else:
-                g = g.Buffer(true_w / 2.0, 4)
-        elif layer == "water":
-            # an area too thin everywhere for the minimum (a narrow river polygon
-            # with no centerline) is grown to the minimum width
-            mw = min_w["water"]
-            thin = g.Buffer(-mw / 2.0, 2)
-            if thin is None or thin.IsEmpty():
-                g = g.Buffer(mw / 2.0 + margin, 4)
-                stats[layer]["widened"] += 1
-        if g is not None and not g.IsEmpty():
-            shapes[layer].append(g)
-
-    nx, ny = ds.RasterXSize, ds.RasterYSize
-    masks = {}
-    mem = ogr.GetDriverByName("Memory")
-    for layer in s["layers"]:
-        tgt = gdal.GetDriverByName("MEM").Create("", nx, ny, 1, gdal.GDT_Byte)
-        tgt.SetGeoTransform(ds.GetGeoTransform())
-        tgt.SetProjection(ds.GetProjection())
-        src = mem.CreateDataSource("m")
-        lyr = src.CreateLayer("f", srs=proj, geom_type=ogr.wkbUnknown)
-        for g in shapes[layer]:
-            ft = ogr.Feature(lyr.GetLayerDefn())
-            ft.SetGeometry(g)
-            lyr.CreateFeature(ft)
-        gdal.RasterizeLayer(tgt, [1], lyr, burn_values=[1])
-        masks[layer] = tgt.GetRasterBand(1).ReadAsArray().astype(bool)
-    for layer in s["layers"]:
-        log(f" {layer}: {stats[layer]['features']} features, "
-            f"{stats[layer]['widened']} widened to the minimum, {int(masks[layer].sum())} cells")
-    return masks, stats
-
-
-def drop_small(mask, min_cells):
-    """Remove connected blobs smaller than min_cells."""
-    from scipy import ndimage
-    lab, n = ndimage.label(mask)
-    if n == 0:
-        return mask
-    sizes = np.bincount(lab.ravel())
-    keep = sizes >= min_cells
-    keep[0] = False
-    return keep[lab]
-
-
-def build_labels(masks, valid, s, feature_res_mm, log=print):
-    """Combine masks into one label grid: 0 = terrain, 1..K = layer index in
-    s['layers'] order. Priority list decides overlaps (first wins)."""
-    lab = np.zeros(valid.shape, np.int16)
-    min_cells = (s["min_feature_size_mm"] / feature_res_mm) ** 2 * 0.785  # circle of that diameter
-    order = [l for l in s["feature_priority"] if l in s["layers"]] + \
-            [l for l in s["layers"] if l not in s["feature_priority"]]
-    for layer in reversed(order):              # lowest priority first, higher overwrite
-        m = masks[layer] & valid
-        if layer in ("water", "towns"):
-            before = int(m.sum())
-            m = drop_small(m, min_cells)
-            if before - int(m.sum()):
-                log(f" {layer}: dropped {before - int(m.sum())} cells in features under "
-                    f"{s['min_feature_size_mm']} mm across")
-        lab[m] = s["layers"].index(layer) + 1
-    return lab
+def clean_diagonals(valid):
+    """Remove cells that touch the rest of the model only at a corner
+    (a 2x2 checkerboard), which would make a pinched, non-manifold solid."""
+    v = valid.copy()
+    while True:
+        a, b, c, d = v[:-1, :-1], v[:-1, 1:], v[1:, :-1], v[1:, 1:]
+        k1 = a & d & ~b & ~c          # cells a and d touch only at a corner
+        k2 = b & c & ~a & ~d
+        if not (k1.any() or k2.any()):
+            return v
+        v[:-1, :-1][k1] = False
+        v[:-1, 1:][k2] = False
 
 
 # --------------------------------------------------------------------------
-# meshing
+# feature outlines (smooth, in print millimeters)
+# --------------------------------------------------------------------------
+
+def _to_shapely(g):
+    return shapely.wkb.loads(bytes(g.ExportToWkb()))
+
+
+def _polygonal(g):
+    """Keep only the area parts of a geometry (drops stray lines/points)."""
+    if g is None or g.is_empty:
+        return shapely.geometry.Polygon()
+    if g.geom_type in ("Polygon", "MultiPolygon"):
+        return g
+    if g.geom_type == "GeometryCollection":
+        parts = [p for p in g.geoms if p.geom_type in ("Polygon", "MultiPolygon")]
+        return shapely.ops.unary_union(parts) if parts else shapely.geometry.Polygon()
+    return shapely.geometry.Polygon()
+
+
+def _parts(g):
+    g = _polygonal(g)
+    if g.is_empty:
+        return []
+    return list(g.geoms) if g.geom_type == "MultiPolygon" else [g]
+
+
+def features_to_shapes(feats, ds, s, m_per_mm, log=print):
+    """Turn features into one smooth outline per layer, in millimeters on the
+    print (x from the west edge, y from the south edge of the grid).
+
+    Lines (roads, rivers, streams) become bands along their true centerlines,
+    at their real width or the minimum printed width, whichever is larger.
+    Areas keep their real outlines; a water area too thin everywhere for the
+    minimum is grown to it. Overlaps are settled by feature_priority (first
+    wins), then slivers and features under min_feature_size_mm are removed.
+
+    Returns (shapes, raw_water, stats): shapes[layer] is a shapely geometry,
+    raw_water is all water before roads were cut out of it (used for bridges).
+    """
+    gt = ds.GetGeoTransform()
+    nx, ny = ds.RasterXSize, ds.RasterYSize
+    x0 = gt[0]
+    y0 = gt[3] + ny * gt[5]                       # south edge (gt[5] < 0)
+    to_mm = [1.0 / m_per_mm, 0, 0, 1.0 / m_per_mm, -x0 / m_per_mm, -y0 / m_per_mm]
+    cell_mm = abs(gt[1]) / m_per_mm
+    domain = shapely.geometry.box(0, 0, nx * cell_mm, ny * cell_mm)
+
+    proj = osr.SpatialReference(wkt=ds.GetProjection())
+    proj.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    tr = osr.CoordinateTransformation(_wgs84(), proj)
+    min_w = {"roads": s["road_min_width_mm"], "water": s["water_min_width_mm"]}
+    stats = {l: {"features": 0, "widened": 0} for l in s["layers"]}
+    pieces = {l: [] for l in s["layers"]}
+    # only features near the model matter; skip the rest before buffering
+    near = domain.buffer(5.0)
+    for f in feats:
+        g = f["geom"].Clone()
+        g.Transform(tr)
+        g = shapely.affinity.affine_transform(_to_shapely(g), to_mm)
+        if not g.intersects(near):
+            continue
+        if not g.is_valid:
+            g = shapely.make_valid(g)
+        layer = f["layer"]
+        stats[layer]["features"] += 1
+        if f["kind"] == "line":
+            true_w = (f["width_m"] or 0) / m_per_mm
+            w = max(true_w, min_w.get(layer, 0))
+            if min_w.get(layer, 0) > true_w:
+                stats[layer]["widened"] += 1
+            g = g.buffer(w / 2.0, quad_segs=8)
+        elif layer == "water":
+            mw = min_w["water"]
+            if g.buffer(-mw / 2.0).is_empty:
+                g = g.buffer(mw / 2.0, quad_segs=8)
+                stats[layer]["widened"] += 1
+        g = _polygonal(g)
+        if not g.is_empty:
+            pieces[layer].append(g)
+
+    # simplify before settling overlaps, so neighbouring layers share exact edges
+    merged = {l: _polygonal(_polygonal(shapely.ops.unary_union(pieces[l])).intersection(domain)
+                            .simplify(s["outline_tolerance_mm"], preserve_topology=True))
+              for l in s["layers"]}
+    raw_water = merged.get("water", shapely.geometry.Polygon())
+
+    order = [l for l in s["feature_priority"] if l in s["layers"]] + \
+            [l for l in s["layers"] if l not in s["feature_priority"]]
+    shapes, taken = {}, shapely.geometry.Polygon()
+    sliver = s["nozzle_mm"] / 4.0                     # strips thinner than half a line are dropped
+    min_area = math.pi / 4.0 * s["min_feature_size_mm"] ** 2
+    for layer in order:
+        g = _polygonal(merged[layer].difference(taken))
+        g = _polygonal(g.buffer(-sliver).buffer(sliver, quad_segs=8).intersection(g))
+        if layer in ("water", "towns"):
+            keep = [p for p in _parts(g) if p.area >= min_area]
+            dropped = len(_parts(g)) - len(keep)
+            if dropped:
+                log(f" {layer}: dropped {dropped} pieces under {s['min_feature_size_mm']} mm across")
+            g = shapely.geometry.MultiPolygon(keep) if keep else shapely.geometry.Polygon()
+        shapes[layer] = g
+        taken = taken.union(g)
+    for layer in s["layers"]:
+        log(f" {layer}: {stats[layer]['features']} features, "
+            f"{stats[layer]['widened']} widened to the minimum, {shapes[layer].area:,.0f} mm2")
+    return shapes, raw_water, stats
+
+
+def bridge_shape(roads, raw_water, s):
+    """Parts of the roads that cross water, reaching bridge_extend_mm onto each bank."""
+    if roads.is_empty or raw_water.is_empty:
+        return shapely.geometry.Polygon()
+    reach = raw_water.buffer(s["bridge_extend_mm"]) if s["bridge_extend_mm"] > 0 else raw_water
+    return _polygonal(roads.intersection(reach))
+
+
+# --------------------------------------------------------------------------
+# solids (manifold3d)
 # --------------------------------------------------------------------------
 
 def corner_heights(z):
@@ -420,93 +469,62 @@ def corner_heights(z):
     return h
 
 
-def body_mesh(occ, t, hc, cell_mm, bottom=None, u=None):
-    """Watertight triangle soup for one solid.
+def heightfield_solid(valid, hc, cell_mm, top_off, bottom=None, bot_off=None):
+    """Closed solid over the valid cells: top surface = terrain + top_off,
+    bottom = flat at `bottom`, or terrain + bot_off. Every solid built here
+    shares the same corner grid and triangle split, so surfaces at the same
+    offset coincide exactly."""
+    ny, nx = valid.shape
+    used = np.zeros((ny + 1, nx + 1), bool)
+    for di in (0, 1):
+        for dj in (0, 1):
+            used[di:di + ny, dj:dj + nx] |= valid
+    idx = -np.ones(used.shape, np.int64)
+    nc = int(used.sum())
+    idx[used] = np.arange(nc)
+    ci, cj = np.nonzero(used)
+    x = cj * cell_mm
+    y = (ny - ci) * cell_mm                       # row 0 is the north edge
+    zt = hc[ci, cj] + top_off
+    zb = np.full(nc, float(bottom)) if bottom is not None else hc[ci, cj] + bot_off
+    verts = np.concatenate([np.stack([x, y, zt], 1), np.stack([x, y, zb], 1)]).astype(np.float32)
 
-    occ    (ny,nx) bool  cells this body occupies
-    t      (ny,nx) float top offset per cell; top corner z = hc + t
-    hc     (ny+1,nx+1)   shared corner height field (mm)
-    bottom float or None flat bottom z (terrain), else bottom = hc + u
-    u      float         bottom offset when bottom is None
-    Returns (n,3,3) float32 triangles, counter-clockwise seen from outside.
-    """
-    ny, nx = occ.shape
-    I, J = np.nonzero(occ)
-    if I.size == 0:
-        return np.zeros((0, 3, 3), np.float32)
-    tc = t[I, J]
+    I, J = np.nonzero(valid)
+    A, B = idx[I, J], idx[I, J + 1]               # NW, NE
+    C, D = idx[I + 1, J + 1], idx[I + 1, J]       # SE, SW
+    faces = [np.stack([A, D, C], 1), np.stack([A, C, B], 1),           # top
+             np.stack([A, C, D], 1) + nc, np.stack([A, B, C], 1) + nc]  # bottom
+    vp = np.zeros((ny + 2, nx + 2), bool)
+    vp[1:-1, 1:-1] = valid
+    for p, q, ni, nj in ((A, D, I, J - 1), (D, C, I + 1, J), (C, B, I, J + 1), (B, A, I - 1, J)):
+        k = ~vp[ni + 1, nj + 1]                   # outer edge: wall from top down to bottom
+        pp, qq = p[k], q[k]
+        faces += [np.stack([pp + nc, qq + nc, qq], 1), np.stack([pp + nc, qq, pp], 1)]
+    tri = np.concatenate(faces).astype(np.uint32)
+    m = manifold3d.Manifold(manifold3d.Mesh(vert_properties=verts, tri_verts=tri))
+    if m.status() != manifold3d.Error.NoError:
+        raise RuntimeError(f"terrain solid is not closed: {m.status()}")
+    return m
 
-    # corner (row, col) -> xy ; row 0 is north, y grows north
-    def xy(ci, cj):
-        return cj * cell_mm, (ny - ci) * cell_mm
 
-    def top(ci, cj, toff):
-        return hc[ci, cj] + toff
+def prism(shape, z_lo, z_hi):
+    """Vertical prism with the outline of `shape` (shapely, mm)."""
+    rings = []
+    for p in _parts(shape):
+        rings.append(np.asarray(p.exterior.coords, np.float64)[:-1])
+        rings += [np.asarray(r.coords, np.float64)[:-1] for r in p.interiors]
+    if not rings:
+        return manifold3d.Manifold()
+    cs = manifold3d.CrossSection(rings, manifold3d.FillRule.EvenOdd)
+    return manifold3d.Manifold.extrude(cs, z_hi - z_lo).translate((0, 0, z_lo))
 
-    def bot(ci, cj):
-        if bottom is not None:
-            return np.full(ci.shape, float(bottom))
-        return hc[ci, cj] + u
 
-    def P(ci, cj, z):
-        x, y = xy(ci, cj)
-        return np.stack([x, y, z], axis=-1)
-
-    # corners: A top-left (I,J), B top-right (I,J+1), C bottom-right (I+1,J+1), D bottom-left (I+1,J)
-    A = (I, J); B = (I, J + 1); C = (I + 1, J + 1); D = (I + 1, J)
-    At, Bt, Ct, Dt = (P(*k, top(*k, tc)) for k in (A, B, C, D))
-    Ab, Bb, Cb, Db = (P(*k, bot(*k)) for k in (A, B, C, D))
-
-    tris = [np.stack([At, Dt, Ct], 1), np.stack([At, Ct, Bt], 1),     # top, normal +z
-            np.stack([Ab, Cb, Db], 1), np.stack([Ab, Bb, Cb], 1)]     # bottom, normal -z
-
-    # walls: edges in CCW order (from above) P->Q, neighbour across that edge
-    edges = [(A, D, (I, J - 1)),        # west
-             (D, C, (I + 1, J)),        # south
-             (C, B, (I, J + 1)),        # east
-             (B, A, (I - 1, J))]        # north
-    # lowest top offset of the occupied cells around each corner: where a
-    # higher cell's outer wall meets a step down, the wall needs a vertex at
-    # the lower level too, or the mesh gets a T-junction (an open edge)
-    tp = np.full((ny + 2, nx + 2), np.inf)
-    tp[1:-1, 1:-1] = np.where(occ, t, np.inf)
-    tmin_c = np.minimum.reduce([tp[:-1, :-1], tp[:-1, 1:], tp[1:, :-1], tp[1:, 1:]])
-
-    for (p, q, (ni, nj)) in edges:
-        inside = (ni >= 0) & (ni < ny) & (nj >= 0) & (nj < nx)
-        nocc = np.zeros(I.shape, bool)
-        nt = np.zeros(I.shape)
-        nocc[inside] = occ[ni[inside], nj[inside]]
-        nt[inside] = t[ni[inside], nj[inside]]
-        # case 1: neighbour outside the body -> wall from top down to bottom,
-        # as a fan around its centre: pb, qb, qmid, qt, pt, pmid
-        k = ~nocc
-        if k.any():
-            pi, pj, qi, qj, tk = p[0][k], p[1][k], q[0][k], q[1][k], tc[k]
-            pt = P(pi, pj, top(pi, pj, tk))
-            qt = P(qi, qj, top(qi, qj, tk))
-            pb = P(pi, pj, bot(pi, pj))
-            qb = P(qi, qj, bot(qi, qj))
-            pm = P(pi, pj, top(pi, pj, np.minimum(tk, tmin_c[pi, pj])))
-            qm = P(qi, qj, top(qi, qj, np.minimum(tk, tmin_c[qi, qj])))
-            c = (pt + qt + pb + qb) / 4.0
-            ring = [pb, qb, qm, qt, pt, pm]
-            for a in range(6):
-                tris.append(np.stack([c, ring[a], ring[(a + 1) % 6]], 1))
-        # case 2: neighbour in the body but lower top -> step wall down to its top
-        k = nocc & (tc > nt + 1e-9)
-        if k.any():
-            pt = P(p[0][k], p[1][k], top(p[0][k], p[1][k], tc[k]))
-            qt = P(q[0][k], q[1][k], top(q[0][k], q[1][k], tc[k]))
-            pl = P(p[0][k], p[1][k], top(p[0][k], p[1][k], nt[k]))
-            ql = P(q[0][k], q[1][k], top(q[0][k], q[1][k], nt[k]))
-            tris += [np.stack([pl, ql, qt], 1), np.stack([pl, qt, pt], 1)]
-    out = np.concatenate(tris).astype(np.float32)
-    # drop zero-height wall triangles
-    e1 = out[:, 1] - out[:, 0]
-    e2 = out[:, 2] - out[:, 0]
-    area2 = np.linalg.norm(np.cross(e1, e2), axis=1)
-    return out[area2 > 1e-9]
+def manifold_triangles(m):
+    """(n,3,3) float32 triangles of a manifold, outward facing."""
+    mesh = m.to_mesh()
+    v = np.asarray(mesh.vert_properties)[:, :3]
+    t = np.asarray(mesh.tri_verts)
+    return v[t].astype(np.float32)
 
 
 def write_stl(path, tris, name="touchterrain"):
@@ -551,49 +569,79 @@ def make_multicolor(dem_path, job, out_dir, log=print):
     m_per_mm = width_m / tilewidth
     cell_m = s["feature_res_mm"] * m_per_mm
     log(f"model {tilewidth} mm wide = {width_m:.0f} m -> scale 1:{m_per_mm * 1000:,.0f}")
-    log(f"feature grid {s['feature_res_mm']} mm = {cell_m:.1f} m cells")
+    log(f"terrain grid {s['feature_res_mm']} mm = {cell_m:.1f} m cells")
     src = None
 
     rs_path = os.path.join(out_dir, "_dem_resampled.tif")
     resample_dem(dem_path, cell_m, rs_path)
     ds, elev = read_dem(rs_path)
-    valid = ~np.isnan(elev)
+    valid = clean_diagonals(~np.isnan(elev))
     if not valid.any():
         raise ValueError("DEM has no valid cells")
     cell_mm = abs(ds.GetGeoTransform()[1]) / m_per_mm
     log(f"grid {elev.shape[1]} x {elev.shape[0]} cells")
 
-    # features
+    # features, as smooth outlines
     if s["features_file"]:
         log("reading features from", s["features_file"])
         feats = load_features_file(s["features_file"], s)
     else:
         feats = fetch_overpass(dem_bbox_wgs84(ds), s, log)
-    masks, fstats = features_to_masks(feats, ds, s, m_per_mm, log)
-    labels = build_labels(masks, valid, s, s["feature_res_mm"], log)
+    shapes, raw_water, fstats = features_to_shapes(feats, ds, s, m_per_mm, log)
+    bridges = shapely.geometry.Polygon()
+    if "roads" in shapes and s["bridge_height_mm"] != s["road_height_mm"]:
+        bridges = bridge_shape(shapes["roads"], raw_water, s)
+        if not bridges.is_empty:
+            log(f" roads: {len(_parts(bridges))} crossings over water raised "
+                f"{s['bridge_height_mm']} mm")
 
     # heights in mm on the print
     min_el = float(job["min_elev"]) if job.get("min_elev") is not None else float(np.nanmin(elev))
     z = (elev - min_el) / m_per_mm * zscale + basethick
     hc = corner_heights(z)
+    z_lo = -1.0
+    z_hi = float(np.nanmax(hc)) + max(5.0, s["bridge_height_mm"], s["road_height_mm"]) + 1.0
 
     inlay = s["inlay_depth_mm"]
     offsets = {"roads": s["road_height_mm"], "water": s["water_height_mm"],
                "towns": s["town_height_mm"]}
+    slabs = {}
+
+    def slab(top_off):
+        if top_off not in slabs:
+            slabs[top_off] = heightfield_solid(valid, hc, cell_mm, top_off, bot_off=-inlay)
+        return slabs[top_off]
+
+    t0 = time.time()
+    terrain = heightfield_solid(valid, hc, cell_mm, 0.0, bottom=0.0)
+    all_feat = shapely.ops.unary_union([g for g in shapes.values() if not g.is_empty])
     bodies = {}
-    t_terrain = np.where(labels > 0, -inlay, 0.0)
-    bodies["terrain"] = body_mesh(valid, t_terrain, hc, cell_mm, bottom=0.0)
-    for k, layer in enumerate(s["layers"], start=1):
-        occ = labels == k
-        if occ.any():
-            t = np.full(labels.shape, float(offsets[layer]))
-            bodies[layer] = body_mesh(occ, t, hc, cell_mm, u=-inlay)
-        else:
+    if not all_feat.is_empty:
+        # pocket = everything inside the feature outlines above (terrain - inlay)
+        above = heightfield_solid(valid, hc, cell_mm, z_hi, bot_off=-inlay)
+        terrain = terrain - (prism(all_feat, z_lo, z_hi) ^ above)
+    bodies["terrain"] = terrain
+    for layer in s["layers"]:
+        g = shapes[layer]
+        if g.is_empty:
             log(f" {layer}: nothing in this area, no file written")
+            continue
+        if layer == "roads" and not bridges.is_empty:
+            flat = _polygonal(g.difference(bridges))
+            body = prism(flat, z_lo, z_hi) ^ slab(offsets["roads"])
+            body = body + (prism(bridges, z_lo, z_hi) ^ slab(s["bridge_height_mm"]))
+        else:
+            body = prism(g, z_lo, z_hi) ^ slab(offsets[layer])
+        bodies[layer] = body
+    for name, b in bodies.items():
+        if b.status() != manifold3d.Error.NoError:
+            raise RuntimeError(f"{name}: solid could not be built ({b.status()})")
+    log(f" solids built in {time.time() - t0:.1f} s")
 
     base = job.get("zip_file_name", "terrain")
     files = {}
-    for name, tris in bodies.items():
+    for name, body in bodies.items():
+        tris = manifold_triangles(body)
         th = s["toolheads"].get(name, "")
         fn = f"{base}_{name}_T{th}.stl" if th else f"{base}_{name}.stl"
         path = os.path.join(out_dir, fn)
@@ -605,10 +653,13 @@ def make_multicolor(dem_path, job, out_dir, log=print):
     summary = {
         "scale": f"1:{m_per_mm * 1000:,.0f}",
         "model_mm": [round(elev.shape[1] * cell_mm, 2), round(elev.shape[0] * cell_mm, 2)],
-        "feature_res_mm": round(cell_mm, 4),
+        "terrain_grid_mm": round(cell_mm, 4),
         "settings": {k: s[k] for k in DEFAULTS if k not in ("overpass_url",)},
         "features": fstats,
-        "cells": {name: int((labels == k).sum()) for k, name in enumerate(["terrain"] + s["layers"])},
+        "area_mm2": {name: round(g.area, 1) for name, g in shapes.items()},
+        "bridges": len(_parts(bridges)),
+        "bridge_area_mm2": round(bridges.area, 1),
+        "volume_mm3": {name: round(b.volume(), 1) for name, b in bodies.items()},
         "files": files,
         "warnings": warns,
     }

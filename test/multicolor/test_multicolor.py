@@ -4,13 +4,14 @@ uses the repo's sample DEM and a small hand-made features file.
 
     python -m pytest test/multicolor      (or)      python test/multicolor/test_multicolor.py
 """
-import json
 import math
 import os
 import sys
 import tempfile
 
+import manifold3d
 import numpy as np
+import shapely
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -19,6 +20,9 @@ from touchterrain.common import multicolor as mc  # noqa: E402
 
 DEM = os.path.join(ROOT, "stuff", "geotiff_example.tif")
 FEATURES = os.path.join(HERE, "test_features.geojson")
+QUIET = lambda *a: None  # noqa: E731
+
+_cache = {}
 
 
 def _job(**kw):
@@ -26,6 +30,15 @@ def _job(**kw):
          "features_file": FEATURES}
     j.update(kw)
     return j
+
+
+def _build(**kw):
+    """Build once per set of settings; returns (summary, out_dir)."""
+    key = tuple(sorted(kw.items()))
+    if key not in _cache:
+        out = tempfile.mkdtemp()
+        _cache[key] = (mc.make_multicolor(DEM, _job(**kw), out, log=QUIET), out)
+    return _cache[key]
 
 
 def _read_stl(path):
@@ -38,8 +51,7 @@ def _read_stl(path):
 
 def _edge_check(tris):
     """Every edge must be used exactly twice with opposite directions
-    (closed, consistently oriented), except where 4 faces meet at a
-    diagonal-only cell contact, which slicers accept."""
+    (closed and consistently oriented)."""
     v = np.round(tris.reshape(-1, 3), 5)
     _, inv = np.unique(v, axis=0, return_inverse=True)
     f = inv.reshape(-1, 3)
@@ -56,9 +68,18 @@ def _volume(tris):
     return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
 
 
+def _solid(path):
+    """Load an STL back as a manifold3d solid."""
+    tris = _read_stl(path).reshape(-1, 3)
+    v, inv = np.unique(np.round(tris, 6), axis=0, return_inverse=True)
+    m = manifold3d.Manifold(manifold3d.Mesh(vert_properties=v.astype(np.float32),
+                                            tri_verts=inv.reshape(-1, 3).astype(np.uint32)))
+    assert m.status() == manifold3d.Error.NoError, path
+    return m
+
+
 def test_build_and_check():
-    out = tempfile.mkdtemp()
-    s = mc.make_multicolor(DEM, _job(), out, log=lambda *a: None)
+    s, out = _build()
     assert set(s["files"]) == {"terrain", "roads", "water", "towns"}
     vols = {}
     for layer, fn in s["files"].items():
@@ -75,8 +96,7 @@ def test_build_and_check():
 def test_alignment_same_footprint():
     """All parts share one coordinate system: every feature part lies
     inside the terrain's xy extent."""
-    out = tempfile.mkdtemp()
-    s = mc.make_multicolor(DEM, _job(), out, log=lambda *a: None)
+    s, out = _build()
     terr = _read_stl(os.path.join(out, s["files"]["terrain"])).reshape(-1, 3)
     lo, hi = terr.min(0), terr.max(0)
     for layer in ("roads", "water", "towns"):
@@ -84,75 +104,112 @@ def test_alignment_same_footprint():
         assert (p[:, :2] >= lo[:2] - 1e-4).all() and (p[:, :2] <= hi[:2] + 1e-4).all(), layer
 
 
-def _widths_along_lines(mask, feats, ds, cell_mm):
-    """Measure the printed width (mm) of a rasterized line layer at many
-    points, perpendicular to each line's own direction. The cells are
-    treated as the squares they print as."""
-    from osgeo import osr
+def test_parts_never_overlap():
+    """Every pair of parts shares at most a surface, never a volume. Parts
+    that share a surface can show a rounding-level overlap once written as
+    float32 STL; it must stay under 0.0001 mm averaged over the shared area."""
+    s, out = _build()
+    solids = {k: _solid(os.path.join(out, fn)) for k, fn in s["files"].items()}
+    names = list(solids)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            v = (solids[a] ^ solids[b]).volume()
+            shared = min(s["area_mm2"].get(a, 1e9), s["area_mm2"].get(b, 1e9))
+            assert v < 1e-4 * shared + 1e-3, f"{a} and {b} overlap by {v:.4f} mm3"
+
+
+def test_layer_volumes_match_outlines():
+    """Each layer is its outline times a constant thickness (inlay plus its
+    height above the terrain), so the pockets are exactly filled. Flush
+    roads add nothing above the terrain; only the bridges stand up."""
+    s, _ = _build()
+    st = s["settings"]
+    inlay = st["inlay_depth_mm"]
+    a, v = s["area_mm2"], s["volume_mm3"]
+    for layer, h in (("water", st["water_height_mm"]), ("towns", st["town_height_mm"])):
+        want = a[layer] * (inlay + h)
+        assert abs(v[layer] - want) < 0.005 * want + 0.5, (layer, v[layer], want)
+    ab = s["bridge_area_mm2"]
+    want = (a["roads"] - ab) * (inlay + st["road_height_mm"]) + ab * (inlay + st["bridge_height_mm"])
+    assert abs(v["roads"] - want) < 0.005 * want + 0.5, (v["roads"], want)
+
+
+def test_flush_roads_with_bridges():
+    """Defaults: roads are flush, and raised only where they cross water."""
+    s, _ = _build()
+    assert s["settings"]["road_height_mm"] == 0.0
+    assert s["bridges"] >= 1, "the sample stream crosses the roads; expected a raised crossing"
+    assert 0 < s["bridge_area_mm2"] < 0.2 * s["area_mm2"]["roads"]
+
+
+def _road_centerlines_mm(s, tilewidth):
+    """Sample road centerlines and min width, in the same mm frame as the outlines."""
+    from osgeo import gdal, osr
+    st = mc.settings_with_defaults(_job(tilewidth=tilewidth, layers=["roads"]))
+    src = gdal.Open(DEM)
+    m_per_mm = src.RasterXSize * abs(src.GetGeoTransform()[1]) / tilewidth
+    out = tempfile.mkdtemp()
+    rs = mc.resample_dem(DEM, st["feature_res_mm"] * m_per_mm, os.path.join(out, "r.tif"))
+    ds, _ = mc.read_dem(rs)
+    feats = [f for f in mc.load_features_file(FEATURES, st) if f["layer"] == "roads"]
+    shapes, _, _ = mc.features_to_shapes(feats, ds, st, m_per_mm, log=QUIET)
     gt = ds.GetGeoTransform()
     proj = osr.SpatialReference(wkt=ds.GetProjection())
     proj.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
     tr = osr.CoordinateTransformation(mc._wgs84(), proj)
-    ny, nx = mask.shape
-    widths = []
+    y0 = gt[3] + ds.RasterYSize * gt[5]
+    lines = []
     for f in feats:
         g = f["geom"].Clone()
         g.Transform(tr)
-        pts = [((x - gt[0]) / gt[1], (y - gt[3]) / gt[5]) for x, y in g.GetPoints()]  # pixel col,row
-        for (c0, r0), (c1, r1) in zip(pts[:-1], pts[1:]):
-            L = math.hypot(c1 - c0, r1 - r0)
-            if L == 0:
-                continue
-            dc, dr = (c1 - c0) / L, (r1 - r0) / L
-            pc, pr = -dr, dc
-            for u in np.arange(3, L - 3, 0.5):        # skip the segment ends (bends, joins)
-                c, r = c0 + u * dc, r0 + u * dr
-                if not (8 < c < nx - 8 and 8 < r < ny - 8):
-                    continue
-                span = []
-                for sgn in (1, -1):
-                    t = 0.0
-                    while True:
-                        cc, rr = c + sgn * t * pc, r + sgn * t * pr
-                        if not mask[int(math.floor(rr)), int(math.floor(cc))]:
-                            break
-                        t += 0.02
-                    span.append(t)
-                widths.append(sum(span) * cell_mm)
-    return np.array(widths)
+        lines.append(shapely.geometry.LineString(
+            [((x - gt[0]) / m_per_mm, (y - y0) / m_per_mm) for x, y in g.GetPoints()]))
+    return shapes["roads"], lines, st, m_per_mm
 
 
 def test_minimum_width_scales():
     """Roads are never narrower than road_min_width_mm on the print: widened
     at small scale (1:125,000), true width at large scale (1:31,000)."""
-    from osgeo import gdal
     for tilewidth in (120, 480):
-        out = tempfile.mkdtemp()
-        job = _job(tilewidth=tilewidth, layers=["roads"])
-        s = mc.settings_with_defaults(job)
-        src = gdal.Open(DEM)
-        m_per_mm = src.RasterXSize * abs(src.GetGeoTransform()[1]) / tilewidth
-        rs = mc.resample_dem(DEM, s["feature_res_mm"] * m_per_mm, os.path.join(out, "r.tif"))
-        ds, elev = mc.read_dem(rs)
-        feats = [f for f in mc.load_features_file(FEATURES, s) if f["kind"] == "line"]
-        masks, _ = mc.features_to_masks(feats, ds, s, m_per_mm, log=lambda *a: None)
-        cell_mm = abs(ds.GetGeoTransform()[1]) / m_per_mm
-        w = _widths_along_lines(masks["roads"], feats, ds, cell_mm)
-        assert len(w) > 50
-        assert w.min() >= s["road_min_width_mm"] - 1e-6, \
-            f"tilewidth {tilewidth}: narrowest road {w.min():.3f} mm < {s['road_min_width_mm']} mm"
-        print(f"   1:{m_per_mm * 1000:,.0f}  road width min {w.min():.2f} / median {np.median(w):.2f} mm "
-              f"over {len(w)} samples")
+        roads, lines, st, m_per_mm = _road_centerlines_mm(None, tilewidth)
+        box = roads.envelope.buffer(-1.0)
+        for ln in lines:
+            ln = ln.intersection(box)
+            if ln.is_empty:
+                continue
+            band = ln.buffer(st["road_min_width_mm"] / 2.0 - 0.025, cap_style="flat")
+            missing = band.difference(roads).area
+            assert missing < 1e-3 * band.area, \
+                f"1:{m_per_mm * 1000:,.0f}: a road is narrower than {st['road_min_width_mm']} mm"
+
+
+def test_outlines_are_smooth():
+    """Outlines follow the real road directions instead of stair-stepping
+    along the grid: most of the outline length is not axis-parallel."""
+    roads, _, _, _ = _road_centerlines_mm(None, 120)
+    axis, total = 0.0, 0.0
+    for p in mc._parts(roads):
+        c = np.asarray(p.exterior.coords)
+        d = np.diff(c, axis=0)
+        L = np.hypot(d[:, 0], d[:, 1])
+        total += L.sum()
+        axis += L[(np.abs(d[:, 0]) < 1e-6) | (np.abs(d[:, 1]) < 1e-6)].sum()
+    assert total > 0 and axis / total < 0.2, f"{axis / total:.0%} of the road outline is axis-parallel"
 
 
 def test_settings_rules():
-    s = mc.settings_with_defaults({"feature_res_mm": 1.0})
-    w = mc.check_settings(s, basethick=0.5, log=lambda *a: None)
-    assert s["feature_res_mm"] <= 0.8 / 3 + 1e-9
-    assert any("basethick" in x for x in w)
     s = mc.settings_with_defaults({"road_min_width_mm": 0.5})
-    w = mc.check_settings(s, basethick=2, log=lambda *a: None)
+    w = mc.check_settings(s, basethick=2, log=QUIET)
     assert any("nozzle" in x for x in w)
+    s = mc.settings_with_defaults({})
+    w = mc.check_settings(s, basethick=0.5, log=QUIET)
+    assert any("basethick" in x for x in w)
+    s = mc.settings_with_defaults({"water_height_mm": -0.6})
+    try:
+        mc.check_settings(s, basethick=2, log=QUIET)
+        raise AssertionError("a layer recessed deeper than its inlay should be refused")
+    except ValueError:
+        pass
 
 
 def test_overpass_parsing():
@@ -186,8 +243,12 @@ def test_overpass_parsing():
 
 if __name__ == "__main__":
     s, vols = test_build_and_check()
-    print("watertight + oriented: OK;  volumes (mm3):", {k: round(v) for k, v in vols.items()})
+    print("closed + oriented: OK;  volumes (mm3):", {k: round(v) for k, v in vols.items()})
     test_alignment_same_footprint(); print("alignment: OK")
+    test_parts_never_overlap(); print("no overlaps between parts: OK")
+    test_layer_volumes_match_outlines(); print("pockets exactly filled: OK")
+    test_flush_roads_with_bridges(); print(f"flush roads, {s['bridges']} raised crossing(s): OK")
     test_minimum_width_scales(); print("minimum width at two scales: OK")
+    test_outlines_are_smooth(); print("smooth outlines: OK")
     test_settings_rules(); print("settings rules: OK")
     test_overpass_parsing(); print("OpenStreetMap parsing: OK")

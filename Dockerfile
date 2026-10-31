@@ -13,6 +13,9 @@ COPY --chown=$MAMBA_USER:$MAMBA_USER requirements.txt /app/requirements.txt
 # everything else from requirements.txt via pip; GDAL and numpy already come from conda
 RUN grep -viE "^(gdal|numpy)" requirements.txt > /tmp/req.txt \
  && pip install --no-cache-dir -r /tmp/req.txt
+# multicolor: exact inlay pockets (not on conda-forge). Its wheel links the C++
+# runtime, so point the loader at conda's newer copy (GDAL needs that one).
+RUN pip install --no-cache-dir "manifold3d>=3.5,<4"
 
 COPY --chown=$MAMBA_USER:$MAMBA_USER . /app
 # the container may run as your own user id (see docker-compose.yml), so let it write here
@@ -21,6 +24,7 @@ RUN chmod -R a+rwX /app
 USER $MAMBA_USER
 
 ENV PYTHONPATH=/app \
+    LD_LIBRARY_PATH=/opt/conda/lib \
     PYTHONUNBUFFERED=1 \
     TOUCHTERRAIN_EE_SA_CREDS=/secrets/ee-key.json \
     TOUCHTERRAIN_TMP_FOLDER=/output/server/tmp \

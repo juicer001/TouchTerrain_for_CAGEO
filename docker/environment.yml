@@ -10,4 +10,6 @@ dependencies:
   - scipy
   - matplotlib-base
   - pillow
+  # multicolor: smooth feature outlines (manifold3d comes from pip, see Dockerfile)
+  - shapely>=2.0,<3
   - pip
